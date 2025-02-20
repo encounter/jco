@@ -216,9 +216,12 @@ export async function cliTest(_fixtures) {
       );
       strictEqual(stderr, "");
       const source = await readFile(`${outDir}/flavorful.d.ts`, "utf8");
-      ok(source.includes("export const test"));
+      ok(source.includes("export { TestFlavorfulTest as test }"));
       const iface = await readFile(`${outDir}/interfaces/test-flavorful-test.d.ts`, "utf8");
-      ok(iface.includes("export namespace TestFlavorfulTest {"));
+      ok(iface.includes("declare module 'test:flavorful/test' {"));
+      ok(iface.includes("export { listOfVariants }")); // export function
+      ok(iface.includes("export type { MyErrno }")); // export enum
+      ok(iface.includes("export type { ListInAlias }")); // export type alias
     });
 
     test("Type generation (specific features)", async () => {

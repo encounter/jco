@@ -70,7 +70,7 @@ pub struct TranspileOpts {
     /// Whether to output core Wasm utilizing multi-memory or to polyfill
     /// this handling.
     pub multi_memory: bool,
-    /// Whether to generate types for a guest module using module declarations.
+    /// Whether to generate types for a guest module.
     pub guest: bool,
     /// Configure whether to use `async` imports or exports with
     /// JavaScript Promise Integration (JSPI).

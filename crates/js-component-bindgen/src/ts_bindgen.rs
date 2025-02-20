@@ -32,7 +32,8 @@ struct TsBindgen {
     /// TypeScript definitions which will become the export object
     export_object: Source,
 
-    /// Whether or not the types should be generated for a guest module
+    /// Whether to generate types for a guest module.
+    #[expect(unused)] // Currently unused
     guest: bool,
 
     async_imports: HashSet<String>,
@@ -258,9 +259,9 @@ pub fn ts_bindgen(
             } else {
                 uwriteln!(
                     bindgen.export_object,
-                    "export const {}: typeof {};",
-                    alias,
-                    local_name.to_upper_camel_case()
+                    "export {{ {} as {} }};",
+                    local_name.to_upper_camel_case(),
+                    alias
                 );
             }
         }
@@ -464,7 +465,7 @@ impl TsBindgen {
         } else {
             uwriteln!(
                 self.export_object,
-                "export const {}: typeof {local_name};",
+                "export {{ {local_name} as {} }};",
                 maybe_quote_id(export_name)
             );
         }
@@ -519,9 +520,7 @@ impl TsBindgen {
         let goal_name = interface_goal_name(&id_name);
         let goal_name_kebab = goal_name.to_kebab_case();
         let file_name = &format!("interfaces/{}.d.ts", goal_name_kebab);
-        let (name, iface_exists) = self.interface_names.get_or_create(file_name, &goal_name);
-
-        let camel = name.to_upper_camel_case();
+        let (_name, iface_exists) = self.interface_names.get_or_create(file_name, &goal_name);
 
         let (local_name, local_exists) = self.local_names.get_or_create(file_name, &goal_name);
         let local_name = local_name.to_upper_camel_case();
@@ -530,21 +529,28 @@ impl TsBindgen {
             // TypeScript doesn't work with empty namespaces, so we don't import in this case,
             // just define them as empty.
             let is_empty_interface = resolve.interfaces[id].functions.is_empty()
-                && resolve.interfaces[id]
-                    .types
-                    .iter()
-                    .all(|(_, ty)| !matches!(resolve.types[*ty].kind, TypeDefKind::Resource));
+                && resolve.interfaces[id].types.iter().all(|(_, ty)| {
+                    !matches!(
+                        resolve.types[*ty].kind,
+                        TypeDefKind::Resource
+                            | TypeDefKind::Record(_)
+                            | TypeDefKind::Flags(_)
+                            | TypeDefKind::Tuple(_)
+                            | TypeDefKind::Enum(_)
+                            | TypeDefKind::Variant(_)
+                            | TypeDefKind::Option(_)
+                            | TypeDefKind::Result(_)
+                            | TypeDefKind::List(_)
+                            | TypeDefKind::Type(_)
+                    )
+                });
             if is_empty_interface {
                 uwriteln!(self.src, "declare const {local_name}: {{}};");
             } else {
                 uwriteln!(
                     self.src,
-                    "import {{ {} }} from './{}.js';",
-                    if camel == local_name {
-                        camel.to_string()
-                    } else {
-                        format!("{camel} as {local_name}")
-                    },
+                    "import * as {} from './{}.js';",
+                    local_name,
                     &file_name[0..file_name.len() - 5]
                 );
             }
@@ -560,49 +566,58 @@ impl TsBindgen {
             self.async_imports.clone()
         };
 
-        let module_or_namespace = if self.guest {
-            format!("declare module '{id_name}' {{")
-        } else {
-            format!("export namespace {camel} {{")
-        };
-
         let mut gen = TsInterface::new(resolve, false);
 
-        uwriteln!(gen.src, "{module_or_namespace}");
-        for (_, func) in resolve.interfaces[id].functions.iter() {
+        uwriteln!(gen.src, "declare module '{id_name}' {{");
+        for (_, func) in resolve.interfaces[id]
+            .functions
+            .iter()
+            .filter(|(_, func)| func.kind == FunctionKind::Freestanding)
+        {
             // Ensure that the function  the world item for stability guarantees and exclude if they do not match
             if !feature_gate_allowed(resolve, package, &func.stability, &func.name)
                 .expect("failed to check feature gate for function")
             {
                 continue;
             }
-            let func_name = &func.name;
-            let is_async = is_world_export && async_funcs.contains(func_name)
-                || async_funcs.contains(&format!("{id_name}#{func_name}"))
-                || id_name
-                    .find('@')
-                    .map(|i| {
-                        async_funcs.contains(&format!("{}#{func_name}", id_name.get(0..i).unwrap()))
-                    })
-                    .unwrap_or(false);
-            gen.ts_func(func, false, true, is_async);
+            let func_name = func.item_name().to_lower_camel_case();
+            uwriteln!(gen.src, "export {{ {} }};", func_name);
         }
         // Export resources for the interface
         for (_, ty) in resolve.interfaces[id].types.iter() {
             let ty = &resolve.types[*ty];
-            if let TypeDefKind::Resource = ty.kind {
-                let resource = ty.name.as_ref().unwrap();
-                if !gen.resources.contains_key(resource) {
-                    uwriteln!(gen.src, "export {{ {} }};", resource.to_upper_camel_case());
-                    gen.resources
-                        .insert(resource.to_string(), TsInterface::new(resolve, false));
+            match ty.kind {
+                TypeDefKind::Resource => {
+                    let resource = ty.name.as_ref().unwrap();
+                    if !gen.resources.contains_key(resource) {
+                        uwriteln!(gen.src, "export {{ {} }};", resource.to_upper_camel_case());
+                        gen.resources
+                            .insert(resource.to_string(), TsInterface::new(resolve, false));
+                    }
                 }
+                TypeDefKind::Record(_)
+                | TypeDefKind::Flags(_)
+                | TypeDefKind::Tuple(_)
+                | TypeDefKind::Enum(_)
+                | TypeDefKind::Variant(_)
+                | TypeDefKind::Option(_)
+                | TypeDefKind::Result(_)
+                | TypeDefKind::List(_)
+                | TypeDefKind::Type(_) => {
+                    let resource = ty.name.as_ref().unwrap();
+                    uwriteln!(
+                        gen.src,
+                        "export type {{ {} }};",
+                        resource.to_upper_camel_case()
+                    );
+                }
+                _ => (),
             }
         }
 
         uwriteln!(gen.src, "}}");
 
-        gen.types(id);
+        gen.types(id, is_world_export, &async_funcs, &id_name);
         gen.post_types();
 
         let src = gen.finish();
@@ -660,10 +675,39 @@ impl<'a> TsInterface<'a> {
         }
     }
 
-    fn types(&mut self, iface_id: InterfaceId) {
-        let iface = &self.resolve().interfaces[iface_id];
+    fn types(
+        &mut self,
+        iface_id: InterfaceId,
+        is_world_export: bool,
+        async_funcs: &HashSet<String>,
+        id_name: &str,
+    ) {
+        let resolve = self.resolve();
+        let iface = &resolve.interfaces[iface_id];
+        let package = resolve
+            .packages
+            .get(iface.package.expect("missing package on interface"))
+            .expect("unexpectedly missing package");
+        for (_, func) in iface.functions.iter() {
+            // Ensure that the function  the world item for stability guarantees and exclude if they do not match
+            if !feature_gate_allowed(resolve, package, &func.stability, &func.name)
+                .expect("failed to check feature gate for function")
+            {
+                continue;
+            }
+            let func_name = &func.name;
+            let is_async = is_world_export && async_funcs.contains(func_name)
+                || async_funcs.contains(&format!("{id_name}#{func_name}"))
+                || id_name
+                    .find('@')
+                    .map(|i| {
+                        async_funcs.contains(&format!("{}#{func_name}", id_name.get(0..i).unwrap()))
+                    })
+                    .unwrap_or(false);
+            self.ts_func(func, false, true, is_async);
+        }
         for (name, id) in iface.types.iter() {
-            let ty = &self.resolve().types[*id];
+            let ty = &resolve.types[*id];
             match &ty.kind {
                 TypeDefKind::Record(record) => self.type_record(*id, name, record, &ty.docs),
                 TypeDefKind::Flags(flags) => self.type_flags(*id, name, flags, &ty.docs),
@@ -1125,7 +1169,8 @@ impl<'a> TsInterface<'a> {
                         "import type {{ {orig_name} as {type_name} }} from '{path_prefix}{owned_interface_name}.js';",
                     );
                 }
-                self.src.push_str(&format!("export {{ {} }};\n", type_name));
+                self.src
+                    .push_str(&format!("export type {{ {} }};\n", type_name));
             }
             _ => {
                 self.docs(docs);
