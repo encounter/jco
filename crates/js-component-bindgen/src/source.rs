@@ -74,6 +74,11 @@ impl Source {
     pub fn as_mut_string(&mut self) -> &mut String {
         &mut self.s
     }
+
+    pub fn clear(&mut self) {
+        self.s.clear();
+        self.indent = 0;
+    }
 }
 
 impl Write for Source {

@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
 
 use anyhow::{Context as _, Result};
@@ -33,11 +33,15 @@ struct TsBindgen {
     export_object: Source,
 
     /// Whether to generate types for a guest module.
-    #[expect(unused)] // Currently unused
-    guest: bool,
+    is_guest: bool,
 
     async_imports: HashSet<String>,
     async_exports: HashSet<String>,
+
+    /// A set of all interface files that are referenced by the generated
+    /// definitions. This is used to generate `/// <reference path="..." />`
+    /// directives at the top of the file.
+    references: BTreeSet<String>,
 }
 
 /// Used to generate a `*.d.ts` file for each imported and exported interface for
@@ -52,8 +56,10 @@ struct TsInterface<'a> {
     has_constructor: bool,
     needs_ty_option: bool,
     needs_ty_result: bool,
+    needs_module_end: bool,
     local_names: LocalNames,
     resources: BTreeMap<String, TsInterface<'a>>,
+    references: BTreeSet<String>,
 }
 
 pub fn ts_bindgen(
@@ -63,6 +69,7 @@ pub fn ts_bindgen(
     opts: &TranspileOpts,
     files: &mut Files,
 ) -> Result<()> {
+    let instantiation = opts.instantiation.is_some();
     let (async_imports, async_exports) = match opts.async_mode.clone() {
         None | Some(AsyncMode::Sync) => (Default::default(), Default::default()),
         Some(AsyncMode::JavaScriptPromiseIntegration { imports, exports }) => {
@@ -75,9 +82,10 @@ pub fn ts_bindgen(
         local_names: LocalNames::default(),
         import_object: Source::default(),
         export_object: Source::default(),
-        guest: opts.guest,
+        is_guest: opts.guest,
         async_imports,
         async_exports,
+        references: Default::default(),
     };
 
     let world = &resolve.worlds[id];
@@ -89,6 +97,11 @@ pub fn ts_bindgen(
                 .context("unexpectedly missing package in world")?,
         )
         .context("unexpectedly missing package in world for ID")?;
+
+    if bindgen.is_guest {
+        let id_name = package.name.interface_id(&world.name);
+        uwriteln!(bindgen.src, "declare module '{id_name}' {{");
+    }
 
     {
         let mut funcs = Vec::new();
@@ -125,7 +138,13 @@ pub fn ts_bindgen(
                     match name {
                         WorldKey::Name(name) => {
                             // kebab name -> direct ns namespace import
-                            bindgen.import_interface(resolve, name, *id, files);
+                            bindgen.world_import_interface(
+                                resolve,
+                                name,
+                                *id,
+                                files,
+                                instantiation,
+                            );
                         }
                         // namespaced ns:pkg/iface
                         // TODO: map support
@@ -180,8 +199,9 @@ pub fn ts_bindgen(
                         TypeDefKind::Resource => {}
                         TypeDefKind::Handle(_) => todo!(),
                     }
-                    let output = gen.finish();
-                    bindgen.src.push_str(&output);
+                    let (src, references) = gen.finish();
+                    bindgen.src.push_str(&src);
+                    bindgen.references.extend(references);
                 }
             }
         }
@@ -192,13 +212,17 @@ pub fn ts_bindgen(
         // namespace imports are grouped by namespace / kebab name
         // kebab name imports are direct
         for (name, import_interfaces) in interface_imports {
-            bindgen.import_interfaces(resolve, name.as_ref(), import_interfaces, files);
+            bindgen.world_import_interfaces(
+                resolve,
+                name.as_ref(),
+                import_interfaces,
+                files,
+                instantiation,
+            );
         }
     }
 
     let mut funcs = Vec::new();
-    let mut seen_names = HashSet::new();
-    let mut export_aliases: Vec<(String, String)> = Vec::new();
 
     for (name, export) in world.exports.iter() {
         match export {
@@ -213,7 +237,6 @@ pub fn ts_bindgen(
                     debug!("skipping exported interface [{export_name}] feature gate due to feature gate visibility");
                     continue;
                 }
-                seen_names.insert(export_name.to_string());
                 funcs.push((export_name.to_lower_camel_case(), f));
             }
             WorldItem::Interface { id, stability } => {
@@ -234,40 +257,21 @@ pub fn ts_bindgen(
                     continue;
                 }
 
-                seen_names.insert(export_name.to_string());
-                let local_name = bindgen.export_interface(
+                bindgen.export_interface(resolve, export_name, *id, files, instantiation);
+                // Also export the interface name as a type alias
+                bindgen.export_interface(
                     resolve,
-                    export_name,
+                    &iface_name.to_lower_camel_case(),
                     *id,
                     files,
-                    opts.instantiation.is_some(),
+                    instantiation,
                 );
-                export_aliases.push((iface_name.to_lower_camel_case(), local_name));
             }
             WorldItem::Type(_) => unimplemented!("type exports"),
         }
     }
-    for (alias, local_name) in export_aliases {
-        if !seen_names.contains(&alias) {
-            if opts.instantiation.is_some() {
-                uwriteln!(
-                    bindgen.export_object,
-                    "{}: typeof {},",
-                    alias,
-                    local_name.to_upper_camel_case()
-                );
-            } else {
-                uwriteln!(
-                    bindgen.export_object,
-                    "export {{ {} as {} }};",
-                    local_name.to_upper_camel_case(),
-                    alias
-                );
-            }
-        }
-    }
     if !funcs.is_empty() {
-        bindgen.export_funcs(resolve, id, &funcs, files, opts.instantiation.is_none());
+        bindgen.export_funcs(resolve, id, &funcs, files, !instantiation);
     }
 
     let camel = world.name.to_upper_camel_case();
@@ -278,7 +282,7 @@ pub fn ts_bindgen(
     // With the current representation of a "world" this is an import object
     // per-imported-interface where the type of that field is defined by the
     // interface itbindgen.
-    if opts.instantiation.is_some() {
+    if instantiation {
         uwriteln!(bindgen.src, "export interface ImportObject {{");
         bindgen.src.push_str(&bindgen.import_object);
         uwriteln!(bindgen.src, "}}");
@@ -286,7 +290,7 @@ pub fn ts_bindgen(
 
     // Generate a type definition for the export object from instantiating
     // the component.
-    if opts.instantiation.is_some() {
+    if instantiation {
         uwriteln!(bindgen.src, "export interface {camel} {{",);
         bindgen.src.push_str(&bindgen.export_object);
         uwriteln!(bindgen.src, "}}");
@@ -377,40 +381,66 @@ pub fn ts_bindgen(
         None => {}
     }
 
-    files.push(&format!("{name}.d.ts"), bindgen.src.as_bytes());
+    if bindgen.is_guest {
+        uwriteln!(bindgen.src, "}}");
+    }
+
+    let filename = format!("{name}.d.ts");
+    files.push(
+        &filename,
+        generate_references(&bindgen.references).as_bytes(),
+    );
+    files.push(&filename, bindgen.src.as_bytes());
     Ok(())
 }
 
 impl TsBindgen {
-    fn import_interface(
+    fn world_import_interface(
         &mut self,
         resolve: &Resolve,
         name: &str,
         id: InterfaceId,
         files: &mut Files,
-    ) -> String {
+        instantiation: bool,
+    ) {
+        if !instantiation {
+            // If we're not generating an import object, just ensure that the
+            // interface is generated.
+            self.generate_interface(name, resolve, id, files, !self.is_guest);
+            return;
+        }
         // in case an imported type is used as an exported type
-        let local_name = self.generate_interface(name, resolve, id, files, false);
+        let local_name = self.import_interface(name, resolve, id, files, !self.is_guest);
         uwriteln!(
             self.import_object,
             "{}: typeof {local_name},",
             maybe_quote_id(name)
         );
-        local_name
     }
-    fn import_interfaces(
+
+    fn world_import_interfaces(
         &mut self,
         resolve: &Resolve,
         import_name: &str,
         ifaces: Vec<(String, &InterfaceId)>,
         files: &mut Files,
+        instantiation: bool,
     ) {
+        if !instantiation {
+            // If we're not generating an import object, just ensure that all
+            // interfaces are generated.
+            for (_, &id) in ifaces {
+                let name = resolve.interfaces[id].name.as_ref().unwrap();
+                self.generate_interface(name, resolve, id, files, !self.is_guest);
+            }
+            return;
+        }
         if ifaces.len() == 1 {
             let (iface_name, &id) = ifaces.first().unwrap();
             if iface_name == "*" {
                 uwrite!(self.import_object, "{}: ", maybe_quote_id(import_name));
                 let name = resolve.interfaces[id].name.as_ref().unwrap();
-                let local_name = self.generate_interface(name, resolve, id, files, false);
+                let local_name = self.import_interface(name, resolve, id, files, !self.is_guest);
                 uwriteln!(self.import_object, "typeof {local_name},",);
                 return;
             }
@@ -418,7 +448,7 @@ impl TsBindgen {
         uwriteln!(self.import_object, "{}: {{", maybe_quote_id(import_name));
         for (iface_name, &id) in ifaces {
             let name = resolve.interfaces[id].name.as_ref().unwrap();
-            let local_name = self.generate_interface(name, resolve, id, files, false);
+            let local_name = self.import_interface(name, resolve, id, files, !self.is_guest);
             uwriteln!(
                 self.import_object,
                 "{}: typeof {local_name},",
@@ -438,8 +468,9 @@ impl TsBindgen {
         uwriteln!(self.import_object, "{}: {{", maybe_quote_id(import_name));
         let mut gen = TsInterface::new(resolve, false);
         gen.ts_func(func, true, false, false);
-        let src = gen.finish();
+        let (src, references) = gen.finish();
         self.import_object.push_str(&src);
+        self.references.extend(references);
         uwriteln!(self.import_object, "}},");
     }
 
@@ -450,9 +481,9 @@ impl TsBindgen {
         id: InterfaceId,
         files: &mut Files,
         instantiation: bool,
-    ) -> String {
-        let local_name = self.generate_interface(export_name, resolve, id, files, false);
+    ) {
         if instantiation {
+            let local_name = self.import_interface(export_name, resolve, id, files, self.is_guest);
             uwriteln!(
                 self.export_object,
                 "{}: typeof {local_name},",
@@ -463,13 +494,13 @@ impl TsBindgen {
             // non-identifier exports
             // tracking in https://github.com/microsoft/TypeScript/issues/40594
         } else {
+            let file_name = self.generate_interface(export_name, resolve, id, files, self.is_guest);
             uwriteln!(
                 self.export_object,
-                "export {{ {local_name} as {} }};",
+                "export * as {} from '{file_name}';",
                 maybe_quote_id(export_name)
             );
         }
-        local_name
     }
 
     fn export_funcs(
@@ -496,135 +527,80 @@ impl TsBindgen {
                     .unwrap_or(false);
             gen.ts_func(func, false, declaration, is_async);
         }
-        let src = gen.finish();
+        let (src, references) = gen.finish();
         self.export_object.push_str(&src);
+        self.references.extend(references);
     }
 
+    /// Adds an import for the given interface to the generated source code,
+    /// returning the local name of the imported interface.
+    fn import_interface(
+        &mut self,
+        name: &str,
+        resolve: &Resolve,
+        id: InterfaceId,
+        files: &mut Files,
+        is_import: bool,
+    ) -> String {
+        let id_name = resolve.id_of(id).unwrap_or_else(|| name.to_string());
+        let goal_name = interface_goal_name(&id_name);
+        let file_name = self.generate_interface(name, resolve, id, files, is_import);
+
+        let (local_name, local_exists) = self.local_names.get_or_create(&file_name, &goal_name);
+        let local_name = local_name.to_upper_camel_case();
+        if !local_exists {
+            uwriteln!(self.src, "import * as {} from '{}';", local_name, file_name);
+        }
+
+        local_name
+    }
+
+    /// Generates a definition file for the given interface, if it doesn't already
+    /// exist, and returns the import specifier for the interface.
+    ///
+    /// For host types, the import specifier is `./interfaces/{file}.js`.
+    /// For guest types, the import specifier is the interface ID (e.g. `ns:pkg/iface`).
     fn generate_interface(
         &mut self,
         name: &str,
         resolve: &Resolve,
         id: InterfaceId,
         files: &mut Files,
-        is_world_export: bool,
+        is_import: bool,
     ) -> String {
-        let iface = resolve
-            .interfaces
-            .get(id)
-            .expect("unexpectedly missing interface in resolve");
-        let package = resolve
-            .packages
-            .get(iface.package.expect("missing package on interface"))
-            .expect("unexpectedly missing package");
         let id_name = resolve.id_of(id).unwrap_or_else(|| name.to_string());
         let goal_name = interface_goal_name(&id_name);
         let goal_name_kebab = goal_name.to_kebab_case();
-        let file_name = &format!("interfaces/{}.d.ts", goal_name_kebab);
-        let (_name, iface_exists) = self.interface_names.get_or_create(file_name, &goal_name);
-
-        let (local_name, local_exists) = self.local_names.get_or_create(file_name, &goal_name);
-        let local_name = local_name.to_upper_camel_case();
-
-        if !local_exists {
-            // TypeScript doesn't work with empty namespaces, so we don't import in this case,
-            // just define them as empty.
-            let is_empty_interface = resolve.interfaces[id].functions.is_empty()
-                && resolve.interfaces[id].types.iter().all(|(_, ty)| {
-                    !matches!(
-                        resolve.types[*ty].kind,
-                        TypeDefKind::Resource
-                            | TypeDefKind::Record(_)
-                            | TypeDefKind::Flags(_)
-                            | TypeDefKind::Tuple(_)
-                            | TypeDefKind::Enum(_)
-                            | TypeDefKind::Variant(_)
-                            | TypeDefKind::Option(_)
-                            | TypeDefKind::Result(_)
-                            | TypeDefKind::List(_)
-                            | TypeDefKind::Type(_)
-                    )
-                });
-            if is_empty_interface {
-                uwriteln!(self.src, "declare const {local_name}: {{}};");
-            } else {
-                uwriteln!(
-                    self.src,
-                    "import * as {} from './{}.js';",
-                    local_name,
-                    &file_name[0..file_name.len() - 5]
-                );
-            }
-        }
-
-        if iface_exists {
-            return local_name;
-        }
-
-        let async_funcs = if is_world_export {
-            self.async_exports.clone()
+        let file_stem = if is_import {
+            format!("interfaces/{goal_name_kebab}")
         } else {
-            self.async_imports.clone()
+            format!("interfaces/{goal_name_kebab}")
         };
+        let file_name = format!("{file_stem}.d.ts");
+        let (_name, iface_exists) = self.interface_names.get_or_create(&file_name, &goal_name);
 
-        let mut gen = TsInterface::new(resolve, false);
+        if !iface_exists {
+            let async_funcs = if is_import {
+                self.async_imports.clone()
+            } else {
+                self.async_exports.clone()
+            };
 
-        uwriteln!(gen.src, "declare module '{id_name}' {{");
-        for (_, func) in resolve.interfaces[id]
-            .functions
-            .iter()
-            .filter(|(_, func)| func.kind == FunctionKind::Freestanding)
-        {
-            // Ensure that the function  the world item for stability guarantees and exclude if they do not match
-            if !feature_gate_allowed(resolve, package, &func.stability, &func.name)
-                .expect("failed to check feature gate for function")
-            {
-                continue;
-            }
-            let func_name = func.item_name().to_lower_camel_case();
-            uwriteln!(gen.src, "export {{ {} }};", func_name);
-        }
-        // Export resources for the interface
-        for (_, ty) in resolve.interfaces[id].types.iter() {
-            let ty = &resolve.types[*ty];
-            match ty.kind {
-                TypeDefKind::Resource => {
-                    let resource = ty.name.as_ref().unwrap();
-                    if !gen.resources.contains_key(resource) {
-                        uwriteln!(gen.src, "export {{ {} }};", resource.to_upper_camel_case());
-                        gen.resources
-                            .insert(resource.to_string(), TsInterface::new(resolve, false));
-                    }
-                }
-                TypeDefKind::Record(_)
-                | TypeDefKind::Flags(_)
-                | TypeDefKind::Tuple(_)
-                | TypeDefKind::Enum(_)
-                | TypeDefKind::Variant(_)
-                | TypeDefKind::Option(_)
-                | TypeDefKind::Result(_)
-                | TypeDefKind::List(_)
-                | TypeDefKind::Type(_) => {
-                    let resource = ty.name.as_ref().unwrap();
-                    uwriteln!(
-                        gen.src,
-                        "export type {{ {} }};",
-                        resource.to_upper_camel_case()
-                    );
-                }
-                _ => (),
-            }
+            let mut gen = TsInterface::new(resolve, false);
+
+            gen.begin(&id_name);
+            gen.types(id, !is_import, &async_funcs, &id_name);
+            gen.post_types();
+
+            let (src, references) = gen.finish();
+
+            files.push(&file_name, generate_references(&references).as_bytes());
+            files.push(&file_name, src.as_bytes());
+
+            self.references.insert(format!("./{file_name}"));
         }
 
-        uwriteln!(gen.src, "}}");
-
-        gen.types(id, is_world_export, &async_funcs, &id_name);
-        gen.post_types();
-
-        let src = gen.finish();
-
-        files.push(file_name, src.as_bytes());
-
-        local_name
+        id_name
     }
 }
 
@@ -639,10 +615,17 @@ impl<'a> TsInterface<'a> {
             has_constructor: false,
             needs_ty_option: false,
             needs_ty_result: false,
+            needs_module_end: false,
+            references: Default::default(),
         }
     }
 
-    fn finish(mut self) -> Source {
+    fn begin(&mut self, id_name: &str) {
+        uwriteln!(self.src, "declare module '{id_name}' {{");
+        self.needs_module_end = true;
+    }
+
+    fn finish(mut self) -> (Source, BTreeSet<String>) {
         for (resource, source) in self.resources {
             uwriteln!(
                 self.src,
@@ -658,7 +641,15 @@ impl<'a> TsInterface<'a> {
             self.src.push_str(&source.src);
             uwriteln!(self.src, "}}")
         }
-        self.src
+        if self.src.is_empty() {
+            // If there are no types, we still need to emit an empty module
+            // to satisfy the TypeScript compiler.
+            uwriteln!(self.src, "export {{}};");
+        }
+        if self.needs_module_end {
+            uwriteln!(self.src, "}}");
+        }
+        (self.src, self.references)
     }
 
     fn docs_raw(&mut self, docs: &str) {
@@ -833,13 +824,10 @@ impl<'a> TsInterface<'a> {
         | FunctionKind::Constructor(ty) = func.kind
         {
             let ty = &self.resolve.types[ty];
-            let resource = ty.name.as_ref().unwrap();
-            if !self.resources.contains_key(resource) {
-                uwriteln!(self.src, "export {{ {} }};", resource.to_upper_camel_case());
-                self.resources
-                    .insert(resource.to_string(), TsInterface::new(self.resolve, false));
-            }
-            self.resources.get_mut(resource).unwrap()
+            let resource = ty.name.clone().unwrap();
+            self.resources
+                .entry(resource)
+                .or_insert_with(|| TsInterface::new(self.resolve, false))
         } else {
             self
         };
@@ -1137,10 +1125,10 @@ impl<'a> TsInterface<'a> {
                             if parent_id == i {
                                 None
                             } else {
-                                Some(interface_goal_name(&self.resolve.id_of(i).unwrap()))
+                                Some(self.resolve.id_of(i).unwrap())
                             }
                         } else {
-                            Some(interface_goal_name(&self.resolve.id_of(i).unwrap()))
+                            Some(self.resolve.id_of(i).unwrap())
                         }
                     }
                     _ => None,
@@ -1151,26 +1139,20 @@ impl<'a> TsInterface<'a> {
         let path_prefix = if self.is_root { "./interfaces/" } else { "./" };
         let type_name = name.to_upper_camel_case();
         match owner_not_parent {
-            Some(owned_interface_name) => {
+            Some(owned_interface_id) => {
                 let orig_id = dealias(self.resolve, id);
                 let orig_name = self.resolve.types[orig_id]
                     .name
                     .as_ref()
                     .unwrap()
                     .to_upper_camel_case();
-                if orig_name == type_name {
-                    uwriteln!(
-                        self.src,
-                        "import type {{ {type_name} }} from '{path_prefix}{owned_interface_name}.js';",
-                    );
-                } else {
-                    uwriteln!(
-                        self.src,
-                        "import type {{ {orig_name} as {type_name} }} from '{path_prefix}{owned_interface_name}.js';",
-                    );
-                }
-                self.src
-                    .push_str(&format!("export type {{ {} }};\n", type_name));
+                let owned_interface_name = interface_goal_name(&owned_interface_id);
+                self.references
+                    .insert(format!("{path_prefix}{owned_interface_name}.d.ts"));
+                uwriteln!(
+                    self.src,
+                    "export type {type_name} = import('{owned_interface_id}').{orig_name};",
+                );
             }
             _ => {
                 self.docs(docs);
@@ -1198,4 +1180,12 @@ fn interface_goal_name(iface_name: &str) -> String {
     iface_name_sans_version
         .replace(['/', ':'], "-")
         .to_kebab_case()
+}
+
+fn generate_references(references: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    for reference in references {
+        uwriteln!(out, "/// <reference path=\"{}\" />", reference);
+    }
+    out
 }
